@@ -8,6 +8,7 @@ import io.ktor.server.response.*
 import io.ktor.server.routing.*
 import io.ktor.util.reflect.*
 import io.ktor.utils.io.*
+import kotlinx.coroutines.flow.Flow
 import org.slf4j.LoggerFactory
 import java.util.concurrent.atomic.AtomicLong
 import java.util.concurrent.atomic.AtomicReference
@@ -221,6 +222,58 @@ internal suspend fun respondInvocationResult(call: ApplicationCall, contentType:
 }
 
 /**
+ * Streams the invocation output [chunks] back to the client as a `text/event-stream` response,
+ * writing each emitted chunk as its own properly framed SSE `data:` event and flushing after each
+ * one so the client receives output incrementally (e.g. token-by-token from a model stream).
+ */
+internal suspend fun respondInvocationStream(call: ApplicationCall, chunks: Flow<String>) {
+    call.respondBytesWriter(contentType = ContentType.Text.EventStream) {
+        chunks.collect { chunk ->
+            writeStringUtf8("data: $chunk\n\n")
+            flush()
+        }
+    }
+}
+
+/**
+ * Writes a structured [InvocationResult] back to the client.
+ *
+ * - [InvocationResult.Text] is written via [respondInvocationResult] using the negotiated [contentType]
+ *   (so text/event-stream/octet-stream negotiation still applies).
+ * - [InvocationResult.Binary] is written via `respondBytes` using the result's own content type
+ *   (derived from the originating block's `format`), regardless of the `Accept` header.
+ */
+internal suspend fun respondInvocationResult(call: ApplicationCall, contentType: ContentType, result: InvocationResult) {
+    when (result) {
+        is InvocationResult.Text -> respondInvocationResult(call, contentType, result.value)
+        is InvocationResult.Binary -> call.respondBytes(result.bytes, result.contentType)
+    }
+}
+
+/**
+ * Structured result of an invocation that may carry non-text content.
+ *
+ * Allows handlers to return either plain text or raw binary content (e.g. an image or audio
+ * payload produced by a model) so that the plugin can pick the appropriate Ktor responder
+ * (`respondText` vs `respondBytes`).
+ */
+sealed interface InvocationResult {
+    /** A textual result, written via `respondText` (honoring the negotiated content type). */
+    data class Text(val value: String) : InvocationResult
+
+    /** A binary result, written via `respondBytes` with the given [contentType]. */
+    data class Binary(val bytes: ByteArray, val contentType: ContentType) : InvocationResult {
+        override fun equals(other: Any?): Boolean {
+            if (this === other) return true
+            if (other !is Binary) return false
+            return bytes.contentEquals(other.bytes) && contentType == other.contentType
+        }
+
+        override fun hashCode(): Int = 31 * bytes.contentHashCode() + contentType.hashCode()
+    }
+}
+
+/**
  * Handler type for invocation requests.
  *
  * Receives the request body as a [String] and an [AgentCoreContext] with headers,
@@ -228,6 +281,28 @@ internal suspend fun respondInvocationResult(call: ApplicationCall, contentType:
  * extensions are available.
  */
 typealias InvocationHandler = suspend RoutingContext.(body: String, context: AgentCoreContext) -> String
+
+/**
+ * Handler type for invocation requests that may produce non-text output.
+ *
+ * Receives the request body as a [String] and an [AgentCoreContext] with headers, and returns an
+ * [InvocationResult] so the plugin can pick the correct responder (text vs binary). This is the
+ * natural fit for handlers that return media (image/audio) produced by a model, e.g. by mapping a
+ * Bedrock `ContentBlock` via [toInvocationResult].
+ */
+typealias OutputInvocationHandler = suspend RoutingContext.(body: String, context: AgentCoreContext) -> InvocationResult
+
+/**
+ * Handler type for invocation requests that produce a **stream** of output chunks.
+ *
+ * Receives the request body as a [String] and an [AgentCoreContext] with headers, and returns a
+ * [Flow] of [String] chunks. Each emitted chunk is written to the client as its own
+ * `text/event-stream` `data:` event, so callers receive output incrementally (e.g. token-by-token).
+ *
+ * This is the natural fit for handlers backed by a streaming model API such as Bedrock's
+ * `converseStream`, where each `ContentBlockDelta` text fragment can be emitted as it arrives.
+ */
+typealias StreamingInvocationHandler = suspend RoutingContext.(body: String, context: AgentCoreContext) -> Flow<String>
 
 /**
  * Typed handler for invocation requests.
@@ -265,6 +340,25 @@ class AgentCoreRuntimeConfig {
      * installed. If both are set, the typed handler takes precedence.
      */
     var invocationHandler: InvocationHandler? = null
+
+    /**
+     * The handler that processes invocation requests and may produce non-text output.
+     * Receives the request body as a String and an [AgentCoreContext], returning an [InvocationResult]
+     * that the plugin maps to the appropriate responder (text vs binary).
+     *
+     * Takes precedence over [invocationHandler] but not over a typed handler registered via [handle].
+     */
+    var outputInvocationHandler: OutputInvocationHandler? = null
+
+    /**
+     * The handler that processes invocation requests by streaming output chunks.
+     * Receives the request body as a String and an [AgentCoreContext], returning a [Flow] of [String]
+     * chunks that the plugin writes as individual `text/event-stream` `data:` events.
+     *
+     * Takes precedence over [outputInvocationHandler] and [invocationHandler], but not over a typed
+     * handler registered via [handle].
+     */
+    var streamingInvocationHandler: StreamingInvocationHandler? = null
 
     /**
      * The typed handler registered via [handle], if any.
@@ -366,11 +460,14 @@ val AgentCoreRuntime = createApplicationPlugin(name = "AgentCoreRuntime", create
     val pingService = config.pingService ?: StaticAgentCorePingService(taskTracker)
 
     val stringHandler = config.invocationHandler
+    val outputHandler = config.outputInvocationHandler
+    val streamingHandler = config.streamingInvocationHandler
     val typedInvocation = config.typedInvocation
-    if (stringHandler == null && typedInvocation == null) {
+    if (stringHandler == null && outputHandler == null && streamingHandler == null && typedInvocation == null) {
         throw AgentCoreInvocationException(
-            "No invocation handler configured. Set invocationHandler or register a typed handler " +
-                "via handle<Input, Output> { ... } in AgentCoreRuntime plugin configuration."
+            "No invocation handler configured. Set invocationHandler, outputInvocationHandler, " +
+                "streamingInvocationHandler or register a typed handler via handle<Input, Output> { ... } " +
+                "in AgentCoreRuntime plugin configuration."
         )
     }
 
@@ -420,6 +517,15 @@ val AgentCoreRuntime = createApplicationPlugin(name = "AgentCoreRuntime", create
                         val input = call.receive<Any?>(typedInvocation.inputType)
                         val result = typedInvocation.handle(this, input, context)
                         call.respond(result, typedInvocation.outputType)
+                    } else if (streamingHandler != null) {
+                        val body = call.receiveText()
+                        val chunks = streamingHandler(this, body, context)
+                        respondInvocationStream(call, chunks)
+                    } else if (outputHandler != null) {
+                        val body = call.receiveText()
+                        val responseContentType = resolveResponseContentType(call.request.header(HttpHeaders.Accept))
+                        val result = outputHandler(this, body, context)
+                        respondInvocationResult(call, responseContentType, result)
                     } else {
                         val body = call.receiveText()
                         val responseContentType = resolveResponseContentType(call.request.header(HttpHeaders.Accept))

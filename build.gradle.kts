@@ -14,6 +14,7 @@ dependencies {
     implementation(libs.ktor.server.core)
     implementation(libs.ktor.server.rate.limit)
     implementation(libs.logback.classic)
+    implementation(libs.aws.sdk.bedrockruntime)
 
     testImplementation(libs.ktor.server.test.host)
     testImplementation(libs.ktor.server.content.negotiation)

@@ -321,6 +321,126 @@ class AgentCoreRuntimeTest {
     }
 
     @Test
+    fun `output handler returns binary content with derived content type`() = testApplication {
+        val png = byteArrayOf(0x89.toByte(), 0x50, 0x4E, 0x47)
+        application {
+            install(ContentNegotiation) { json() }
+            install(SSE)
+            install(AgentCoreRuntime) {
+                outputInvocationHandler = { _, _ ->
+                    InvocationResult.Binary(png, ContentType.Image.PNG)
+                }
+            }
+        }
+        client.post("/invocations") {
+            contentType(ContentType.Application.Json)
+            setBody("""{"prompt":"draw"}""")
+        }.apply {
+            assertEquals(HttpStatusCode.OK, status)
+            assertEquals(ContentType.Image.PNG, contentType()?.withoutParameters())
+            assertContentEquals(png, bodyAsBytes())
+        }
+    }
+
+    @Test
+    fun `streaming handler writes each chunk as its own SSE data event`() = testApplication {
+        application {
+            install(ContentNegotiation) { json() }
+            install(SSE)
+            install(AgentCoreRuntime) {
+                streamingInvocationHandler = { _, _ ->
+                    kotlinx.coroutines.flow.flowOf("Hello", " ", "world")
+                }
+            }
+        }
+        client.post("/invocations") {
+            contentType(ContentType.Application.Json)
+            setBody("""{"prompt":"hi"}""")
+        }.apply {
+            assertEquals(HttpStatusCode.OK, status)
+            assertEquals(ContentType.Text.EventStream, contentType()?.withoutParameters())
+            assertEquals("data: Hello\n\ndata:  \n\ndata: world\n\n", bodyAsText())
+        }
+    }
+
+    @Test
+    fun `streaming handler takes precedence over output and string handlers`() = testApplication {
+        application {
+            install(ContentNegotiation) { json() }
+            install(SSE)
+            install(AgentCoreRuntime) {
+                invocationHandler = { _, _ -> "string" }
+                outputInvocationHandler = { _, _ -> InvocationResult.Text("output") }
+                streamingInvocationHandler = { body, _ ->
+                    kotlinx.coroutines.flow.flowOf("streamed:$body")
+                }
+            }
+        }
+        client.post("/invocations") {
+            contentType(ContentType.Text.Plain)
+            setBody("body")
+        }.apply {
+            assertEquals(HttpStatusCode.OK, status)
+            assertEquals("data: streamed:body\n\n", bodyAsText())
+        }
+    }
+
+    @Test
+    fun `output handler returns text content`() = testApplication {
+        application {
+            install(ContentNegotiation) { json() }
+            install(SSE)
+            install(AgentCoreRuntime) {
+                outputInvocationHandler = { body, _ -> InvocationResult.Text("echo:$body") }
+            }
+        }
+        client.post("/invocations") {
+            contentType(ContentType.Text.Plain)
+            setBody("hi")
+        }.apply {
+            assertEquals(HttpStatusCode.OK, status)
+            assertTrue(bodyAsText().contains("echo:hi"))
+        }
+    }
+
+    @Test
+    fun `image content block maps to binary invocation result`() {
+        val bytes = byteArrayOf(1, 2, 3, 4)
+        val block = aws.sdk.kotlin.services.bedrockruntime.model.ContentBlock.Image(
+            aws.sdk.kotlin.services.bedrockruntime.model.ImageBlock {
+                format = aws.sdk.kotlin.services.bedrockruntime.model.ImageFormat.Png
+                source = aws.sdk.kotlin.services.bedrockruntime.model.ImageSource.Bytes(bytes)
+            }
+        )
+        val result = block.toInvocationResult()
+        assertTrue(result is InvocationResult.Binary)
+        assertEquals(ContentType("image", "png"), result.contentType)
+        assertContentEquals(bytes, result.bytes)
+    }
+
+    @Test
+    fun `audio mp3 content block maps to audio mpeg`() {
+        val bytes = byteArrayOf(9, 8, 7)
+        val block = aws.sdk.kotlin.services.bedrockruntime.model.ContentBlock.Audio(
+            aws.sdk.kotlin.services.bedrockruntime.model.AudioBlock {
+                format = aws.sdk.kotlin.services.bedrockruntime.model.AudioFormat.Mp3
+                source = aws.sdk.kotlin.services.bedrockruntime.model.AudioSource.Bytes(bytes)
+            }
+        )
+        val result = block.toInvocationResult()
+        assertTrue(result is InvocationResult.Binary)
+        assertEquals(ContentType("audio", "mpeg"), result.contentType)
+    }
+
+    @Test
+    fun `text content block maps to text invocation result`() {
+        val block = aws.sdk.kotlin.services.bedrockruntime.model.ContentBlock.Text("hello")
+        val result = block.toInvocationResult()
+        assertTrue(result is InvocationResult.Text)
+        assertEquals("hello", result.value)
+    }
+
+    @Test
     fun `context exposes all request headers`() = testApplication {
         application {
             installAgentCoreTestModule(handler = { _, context ->

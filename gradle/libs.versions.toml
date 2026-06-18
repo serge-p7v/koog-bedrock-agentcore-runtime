@@ -2,8 +2,10 @@
 kotlin = "2.3.10"
 ktor = "3.3.3"
 logback = "1.5.13"
+aws-sdk = "1.6.72"
 
 [libraries]
+aws-sdk-bedrockruntime = { module = "aws.sdk.kotlin:bedrockruntime", version.ref = "aws-sdk" }
 ktor-server-core = { module = "io.ktor:ktor-server-core", version.ref = "ktor" }
 ktor-server-content-negotiation = { module = "io.ktor:ktor-server-content-negotiation", version.ref = "ktor" }
 ktor-server-rate-limit = { module = "io.ktor:ktor-server-rate-limit", version.ref = "ktor" }
