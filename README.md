@@ -5,6 +5,10 @@ A Ktor plugin that enables Koog-based applications to conform to the Amazon Bedr
 ## Features
 
 - **Ktor Plugin**: Simple `install(AgentCoreRuntime)` setup with a lambda-based invocation handler
+- **Flexible Handlers**: String, structured (text/binary), streaming (SSE), and typed JSON handlers for the `/invocations` endpoint
+- **Multimodal Output**: `InvocationResult` abstraction returns plain text or raw binary (image/audio/video/document) with the correct `Content-Type`
+- **Streaming**: `streamingInvocationHandler` emits each `Flow` chunk as its own `text/event-stream` `data:` event (e.g. token-by-token from Bedrock `converseStream`)
+- **Bedrock Interop**: `ContentBlock.toInvocationResult()` mappers (in `BedrockRuntimeMappers.kt`) convert Bedrock Converse output blocks into HTTP responses, keeping the core plugin provider-neutral
 - **Health Checks**: Built-in `/ping` endpoint with Healthy/HealthyBusy/Unhealthy status
 - **Async Task Tracking**: `AgentCoreTaskTracker` to prevent premature agent termination during background work
 - **Rate Limiting**: Built-in per-client token-bucket throttling for invocations and ping endpoints
@@ -60,6 +64,84 @@ install(AgentCoreRuntime) {
 ```
 
 > **Tip:** If the [Koog Ktor plugin](https://github.com/JetBrains/koog) is installed, you can pass the `body` parameter directly to `aiAgent()` inside the `invocationHandler`. The plugin makes `aiAgent()` available as a routing extension, so no additional wiring is needed.
+
+## Handler Types
+
+The `/invocations` endpoint supports four mutually exclusive handler styles. When more than one is
+configured, the precedence is: **typed `handle<I, O>` > `streamingInvocationHandler` > `outputInvocationHandler` > `invocationHandler`**.
+
+### `invocationHandler` — `String` in, `String` out
+
+The default text handler shown above. The response `Content-Type` is negotiated from the request's
+`Accept` header (`application/json`, `text/plain`, `application/octet-stream`, or a single
+`text/event-stream` `data:` event).
+
+### `outputInvocationHandler` — structured text or binary output
+
+Returns an `InvocationResult` so the plugin can pick the correct responder. Use this for multimodal
+output such as a generated image or audio payload:
+
+```kotlin
+install(AgentCoreRuntime) {
+    outputInvocationHandler = { body, _ ->
+        // InvocationResult.Text(...) for text, or:
+        InvocationResult.Binary(pngBytes, ContentType.Image.PNG)
+    }
+}
+```
+
+`InvocationResult.Text` honors `Accept`-based negotiation; `InvocationResult.Binary` is always
+written via `respondBytes` using its own `contentType`.
+
+#### Bedrock interop
+
+When working with Amazon Bedrock Converse output, map a `ContentBlock` directly to an
+`InvocationResult` using the extensions in `BedrockRuntimeMappers.kt`:
+
+```kotlin
+outputInvocationHandler = { body, _ ->
+    val response = bedrockClient.converse(/* ... */)
+    response.output!!.asMessage().content.first().toInvocationResult()
+}
+```
+
+`ContentBlock.Text` maps to `InvocationResult.Text`; `Image`/`Audio`/`Video`/`Document` blocks with
+inline bytes map to `InvocationResult.Binary` with a `Content-Type` derived from the block format.
+Blocks that cannot be represented as a single HTTP body (tool use/result, reasoning, or an
+`S3Location`-only source) throw `AgentCoreInvocationException`. These mappers live in a dedicated
+file so the core plugin carries no `aws.sdk` dependency and stays client-agnostic.
+
+### `streamingInvocationHandler` — incremental SSE output
+
+Returns a `Flow<String>`; each emitted chunk is written as its own `text/event-stream` `data:`
+event and flushed immediately, enabling true token-by-token streaming (e.g. from Bedrock
+`converseStream`). The response is always `text/event-stream` regardless of `Accept`.
+
+```kotlin
+install(AgentCoreRuntime) {
+    streamingInvocationHandler = { body, _ ->
+        flow {
+            converseStream(prompt = body).collect { emit(it.deltaText) }
+        }
+    }
+}
+```
+
+### Typed handler — JSON in, JSON out
+
+Register a typed handler via `handle<I, O>` to deserialize the request body into `I` and serialize
+the returned `O` back, delegating to Ktor's `ContentNegotiation`:
+
+```kotlin
+install(AgentCoreRuntime) {
+    handle<MyRequest, MyResponse> { input, context ->
+        MyResponse(answer = process(input.prompt))
+    }
+}
+```
+
+Requires the `ContentNegotiation` plugin (e.g. `json()`) to be installed; install `SSE` as well if
+you use the streaming or event-stream paths.
 
 ## Configuration
 
