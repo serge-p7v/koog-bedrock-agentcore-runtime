@@ -30,8 +30,11 @@ class AgentCoreRuntimeTest {
         install(ContentNegotiation) { json() }
         install(SSE)
         install(AgentCoreRuntime) {
-
-            invocationHandler = handler
+            // Adapt the legacy String->String test lambdas to the unified handler.
+            this.handler = { input, ctx ->
+                val body = (input as InvocationInput.Text).body
+                InvocationResult.Text(handler(this, body, ctx))
+            }
             this.invocationsRateLimit = invocationsRateLimit
             this.pingRateLimit = pingRateLimit
         }
@@ -327,9 +330,7 @@ class AgentCoreRuntimeTest {
             install(ContentNegotiation) { json() }
             install(SSE)
             install(AgentCoreRuntime) {
-                outputInvocationHandler = { _, _ ->
-                    InvocationResult.Binary(png, ContentType.Image.PNG)
-                }
+                handler = { _, _ -> InvocationResult.Binary(png, ContentType.Image.PNG) }
             }
         }
         client.post("/invocations") {
@@ -348,8 +349,8 @@ class AgentCoreRuntimeTest {
             install(ContentNegotiation) { json() }
             install(SSE)
             install(AgentCoreRuntime) {
-                streamingInvocationHandler = { _, _ ->
-                    kotlinx.coroutines.flow.flowOf("Hello", " ", "world")
+                handler = { _, _ ->
+                    InvocationResult.TextStream(kotlinx.coroutines.flow.flowOf("Hello", " ", "world"))
                 }
             }
         }
@@ -364,15 +365,18 @@ class AgentCoreRuntimeTest {
     }
 
     @Test
-    fun `streaming handler takes precedence over output and string handlers`() = testApplication {
+    fun `unified handler can dispatch on input variant`() = testApplication {
         application {
             install(ContentNegotiation) { json() }
             install(SSE)
             install(AgentCoreRuntime) {
-                invocationHandler = { _, _ -> "string" }
-                outputInvocationHandler = { _, _ -> InvocationResult.Text("output") }
-                streamingInvocationHandler = { body, _ ->
-                    kotlinx.coroutines.flow.flowOf("streamed:$body")
+                handler = { input, _ ->
+                    when (input) {
+                        is InvocationInput.Text      -> InvocationResult.Text("text:${input.body}")
+                        is InvocationInput.Binary    -> InvocationResult.Text("binary:${input.bytes.size}")
+                        is InvocationInput.Stream    -> InvocationResult.Text("stream")
+                        is InvocationInput.Multipart -> InvocationResult.Text("multipart")
+                    }
                 }
             }
         }
@@ -381,7 +385,7 @@ class AgentCoreRuntimeTest {
             setBody("body")
         }.apply {
             assertEquals(HttpStatusCode.OK, status)
-            assertEquals("data: streamed:body\n\n", bodyAsText())
+            assertTrue(bodyAsText().contains("text:body"))
         }
     }
 
@@ -391,7 +395,10 @@ class AgentCoreRuntimeTest {
             install(ContentNegotiation) { json() }
             install(SSE)
             install(AgentCoreRuntime) {
-                outputInvocationHandler = { body, _ -> InvocationResult.Text("echo:$body") }
+                handler = { input, _ ->
+                    val body = (input as InvocationInput.Text).body
+                    InvocationResult.Text("echo:$body")
+                }
             }
         }
         client.post("/invocations") {
@@ -456,6 +463,127 @@ class AgentCoreRuntimeTest {
         }.apply {
             assertEquals(HttpStatusCode.OK, status)
             assertTrue(bodyAsText().contains("my-value"))
+        }
+    }
+
+    @Test
+    fun `non-AgentCore throwables are caught and returned as structured 500`() = testApplication {
+        application {
+            installAgentCoreTestModule(handler = { _, _ ->
+                throw IllegalStateException("user-side bug")
+            })
+        }
+        client.post("/invocations") {
+            contentType(ContentType.Application.Json)
+            setBody("""{"prompt":"x"}""")
+        }.apply {
+            assertEquals(HttpStatusCode.InternalServerError, status)
+            val json = Json.parseToJsonElement(bodyAsText()).jsonObject
+            assertEquals("user-side bug", json["error"]?.jsonPrimitive?.content)
+            assertEquals("IllegalStateException", json["type"]?.jsonPrimitive?.content)
+        }
+    }
+
+    @Test
+    fun `payload exceeding maxRequestBytes is rejected with 413 before handler runs`() = testApplication {
+        var handlerCalled = false
+        application {
+            install(SSE)
+            install(AgentCoreRuntime) {
+                maxRequestBytes = 16
+                handler = { _, _ ->
+                    handlerCalled = true
+                    InvocationResult.Text("should not run")
+                }
+            }
+        }
+        client.post("/invocations") {
+            contentType(ContentType.Application.Json)
+            setBody("""{"prompt":"this body is definitely longer than 16 bytes"}""")
+        }.apply {
+            assertEquals(HttpStatusCode.PayloadTooLarge, status)
+        }
+        assertEquals(false, handlerCalled, "Handler must not run when payload exceeds maxRequestBytes")
+    }
+
+    @Test
+    fun `handlerTimeoutMillis triggers 504 when handler runs too long`() = testApplication {
+        application {
+            install(SSE)
+            install(AgentCoreRuntime) {
+                handlerTimeoutMillis = 100
+                handler = { _, _ ->
+                    kotlinx.coroutines.delay(2_000)
+                    InvocationResult.Text("never")
+                }
+            }
+        }
+        client.post("/invocations") {
+            contentType(ContentType.Application.Json)
+            setBody("""{"prompt":"slow"}""")
+        }.apply {
+            assertEquals(HttpStatusCode.GatewayTimeout, status)
+            val json = Json.parseToJsonElement(bodyAsText()).jsonObject
+            assertTrue(json["error"]?.jsonPrimitive?.content?.contains("timed out") == true)
+        }
+    }
+
+    @Test
+    fun `auto-installs ContentNegotiation when missing so typed handler works without manual setup`() = testApplication {
+        application {
+            // Note: no install(ContentNegotiation) here — the plugin should add it.
+            install(AgentCoreRuntime) {
+                handle<TypedRequest, TypedResponse> { input, _ ->
+                    TypedResponse(answer = "auto:${input.prompt}", repeated = input.count)
+                }
+            }
+        }
+        client.post("/invocations") {
+            contentType(ContentType.Application.Json)
+            setBody("""{"prompt":"yo"}""")
+        }.apply {
+            assertEquals(HttpStatusCode.OK, status)
+            val json = Json.parseToJsonElement(bodyAsText()).jsonObject
+            assertEquals("auto:yo", json["answer"]?.jsonPrimitive?.content)
+        }
+    }
+
+    @Test
+    fun `multipart request is exposed via InvocationInput Multipart variant`() = testApplication {
+        application {
+            install(SSE)
+            install(AgentCoreRuntime) {
+                handler = { input, _ ->
+                    if (input is InvocationInput.Multipart) {
+                        val parts = mutableListOf<String>()
+                        var part = input.parts.readPart()
+                        while (part != null) {
+                            parts.add("${part::class.simpleName}:${part.name}")
+                            part.dispose()
+                            part = input.parts.readPart()
+                        }
+                        InvocationResult.Text("parts=${parts.joinToString(",")}")
+                    } else {
+                        InvocationResult.Text("not-multipart:${input::class.simpleName}")
+                    }
+                }
+            }
+        }
+        // Build a multipart request body manually.
+        val boundary = "----test-boundary-1"
+        val body = """
+            ------test-boundary-1
+            Content-Disposition: form-data; name="field1"
+            
+            hello
+            ------test-boundary-1--
+        """.trimIndent().replace("\n", "\r\n") + "\r\n"
+        client.post("/invocations") {
+            header(HttpHeaders.ContentType, "multipart/form-data; boundary=$boundary")
+            setBody(body)
+        }.apply {
+            assertEquals(HttpStatusCode.OK, status)
+            assertTrue(bodyAsText().contains("FormItem:field1"))
         }
     }
 }
