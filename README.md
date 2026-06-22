@@ -236,6 +236,23 @@ Rate limits are applied per client IP address and reset every minute.
 }
 ```
 
+## Example
+
+A full deployable example lives in [`example/`](./example/) — a vision-streaming chat agent
+plus an end-to-end coverage harness verifying every plugin shape against a real Amazon
+Bedrock AgentCore Runtime deployment.
+
+```bash
+cd example
+./deploy/build-and-push.sh   # gradle fatJar → arm64 Docker image → ECR
+./deploy/deploy.sh           # IAM role + AgentCore Runtime (idempotent)
+./deploy/test.sh             # 3 primary chat scenarios + 6 coverage tests
+```
+
+The example uses Gradle composite build (`includeBuild("..")`) so it always compiles
+against the local plugin source. See [`example/README.md`](./example/README.md) for layout
+and verified test results.
+
 ## Requirements
 
 - Kotlin 2.x

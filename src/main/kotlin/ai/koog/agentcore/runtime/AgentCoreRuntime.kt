@@ -1,14 +1,19 @@
 package ai.koog.agentcore.runtime
 
 import io.ktor.http.*
+import io.ktor.serialization.kotlinx.json.json
 import io.ktor.server.application.*
+import io.ktor.server.plugins.contentnegotiation.ContentNegotiation
 import io.ktor.server.plugins.ratelimit.*
 import io.ktor.server.request.*
 import io.ktor.server.response.*
 import io.ktor.server.routing.*
 import io.ktor.util.reflect.*
 import io.ktor.utils.io.*
+import kotlinx.coroutines.channels.SendChannel
 import kotlinx.coroutines.flow.Flow
+import kotlinx.coroutines.flow.channelFlow
+import kotlinx.serialization.json.Json
 import org.slf4j.LoggerFactory
 import java.util.concurrent.atomic.AtomicLong
 import java.util.concurrent.atomic.AtomicReference
@@ -16,9 +21,6 @@ import kotlin.time.Duration.Companion.minutes
 
 /**
  * Well-known AgentCore HTTP headers used by Amazon Bedrock AgentCore Runtime.
- *
- * These headers are passed by the AgentCore Runtime when invoking agents and can be
- * accessed through [AgentCoreContext] in the invocation handler.
  */
 object AgentCoreHeaders {
     // Core AgentCore Headers
@@ -47,16 +49,6 @@ object AgentCoreHeaders {
  *
  * Provides access to all headers sent by the AgentCore Runtime, including session IDs,
  * user IDs, authentication tokens, and custom headers.
- *
- * Example usage:
- * ```kotlin
- * install(AgentCoreRuntime) {
- *     invocationHandler = { body, context ->
- *         val sessionId = context.getHeader(AgentCoreHeaders.SESSION_ID)
- *         // process request...
- *     }
- * }
- * ```
  */
 class AgentCoreContext(private val headers: Headers, val taskTracker: AgentCoreTaskTracker) {
     /** Returns all headers from the invocation request. */
@@ -81,67 +73,34 @@ enum class PingStatus(private val value: String) {
     override fun toString(): String = value
 }
 
-/**
- * Exception thrown when there are issues with AgentCore invocation.
- */
+/** Exception thrown when there are issues with AgentCore invocation. */
 class AgentCoreInvocationException(message: String, cause: Throwable? = null) : RuntimeException(message, cause)
 
 /**
- * Tracks active tasks to report [PingStatus.HEALTHY_BUSY] status during health checks.
- *
- * Amazon AgentCore Runtime monitors agent health and may shut down agents that appear idle.
- * When your agent starts long-running background tasks, use this tracker to communicate
- * that the agent is still actively working to avoid premature termination.
- *
- * The `/ping` endpoint will return **HealthyBusy** while the active task count is greater than 0.
- *
- * Example usage:
- * ```kotlin
- * install(AgentCoreRuntime) {
- *     invocationHandler = { body, context ->
- *         context.taskTracker.increment()  // Tell runtime: "I'm starting background work"
- *         launch {
- *             try {
- *                 // Long-running background work
- *             } finally {
- *                 context.taskTracker.decrement()  // Tell runtime: "Background work completed"
- *             }
- *         }
- *         "Task started"
- *     }
- * }
- * ```
+ * Tracks active background tasks so the `/ping` endpoint can report
+ * [PingStatus.HEALTHY_BUSY] instead of [PingStatus.HEALTHY], preventing the runtime
+ * from scaling the agent down while long-running work is in progress.
  */
 class AgentCoreTaskTracker {
     private val activeTasks = AtomicLong(0)
 
-    /** Increments the active task count. Call when starting a background task. */
     fun increment() { activeTasks.incrementAndGet() }
 
-    /** Decrements the active task count. Call when a background task completes. Will not go below 0. */
     fun decrement() {
         activeTasks.updateAndGet { if (it > 0) it - 1 else 0 }
     }
 
-    /** Returns the current number of active tasks. */
     fun getCount(): Long = activeTasks.get()
 }
 
-/**
- * Ping response data returned by [AgentCorePingService].
- */
+/** Ping response data returned by [AgentCorePingService]. */
 data class AgentCorePingResponse(
     val status: PingStatus,
     val httpStatus: HttpStatusCode,
-    val timeOfLastUpdate: Long
+    val timeOfLastUpdate: Long,
 )
 
-/**
- * Interface for providing ping status.
- *
- * Implement this interface to customize health check behavior, for example
- * to integrate with external health monitoring systems.
- */
+/** Interface for providing ping status. */
 fun interface AgentCorePingService {
     fun getPingStatus(): AgentCorePingResponse
 }
@@ -149,10 +108,8 @@ fun interface AgentCorePingService {
 /**
  * Default ping service that uses [AgentCoreTaskTracker] for busy detection.
  *
- * Returns:
- * - [PingStatus.HEALTHY] when no active tasks
- * - [PingStatus.HEALTHY_BUSY] when there are active tasks
- * - [PingStatus.UNHEALTHY] on any exception
+ * Returns [PingStatus.HEALTHY] (no active tasks), [PingStatus.HEALTHY_BUSY] (active tasks),
+ * or [PingStatus.UNHEALTHY] (any exception).
  */
 class StaticAgentCorePingService(private val taskTracker: AgentCoreTaskTracker) : AgentCorePingService {
     private val cachedResponse = AtomicReference<AgentCorePingResponse>()
@@ -180,14 +137,235 @@ class StaticAgentCorePingService(private val taskTracker: AgentCoreTaskTracker) 
     }
 }
 
+// ---------------------------------------------------------------------------
+//  Sealed input / output types and the unified invocation handler
+// ---------------------------------------------------------------------------
+
+/**
+ * Structured input handed to the unified invocation handler.
+ *
+ * The plugin auto-dispatches based on the request's `Content-Type` and `Content-Length`:
+ *
+ * - `application/json`, `text/...`                       → [Text]      (UTF-8 string)
+ * - `multipart/...`                                      → [Multipart] ([MultiPartData])
+ * - any other type within [binaryStreamThresholdBytes]    → [Binary]    (full bytes)
+ * - any other type beyond the threshold or unknown length → [Stream]    ([ByteReadChannel])
+ *
+ * Handlers pattern-match on the variant they expect; raise an [AgentCoreInvocationException]
+ * for unsupported shapes.
+ */
+sealed interface InvocationInput {
+    /** Request body decoded as a UTF-8 string (used for JSON/text content types). */
+    data class Text(val body: String) : InvocationInput
+
+    /** Request body materialised as raw bytes plus the original `Content-Type`. */
+    class Binary(val bytes: ByteArray, val contentType: ContentType) : InvocationInput {
+        override fun equals(other: Any?): Boolean {
+            if (this === other) return true
+            if (other !is Binary) return false
+            return bytes.contentEquals(other.bytes) && contentType == other.contentType
+        }
+        override fun hashCode(): Int = 31 * bytes.contentHashCode() + contentType.hashCode()
+    }
+
+    /**
+     * Request body as a [ByteReadChannel] for incremental reads. Use this for large uploads
+     * (audio/video/large PDF) where allocating the full payload as a [ByteArray] is undesirable.
+     */
+    class Stream(val channel: ByteReadChannel, val contentType: ContentType) : InvocationInput
+
+    /**
+     * `multipart/form-data` request — handler iterates over [io.ktor.http.content.MultiPartData]
+     * to read individual file/field parts (`PartData.FormItem`, `PartData.FileItem`, etc.).
+     * Useful for file uploads where metadata fields accompany binary blobs.
+     */
+    class Multipart(val parts: io.ktor.http.content.MultiPartData) : InvocationInput
+}
+
+/**
+ * Structured result of an invocation. Each variant maps to a specific HTTP response shape.
+ *
+ * - [Text]         → plain text / JSON / single-event SSE depending on `Accept`.
+ * - [Binary]       → raw bytes with the supplied `Content-Type` and known length.
+ * - [TextStream]   → `text/event-stream` with each chunk written as its own `data:` event.
+ * - [BinaryStream] → chunked binary with the supplied `Content-Type`.
+ */
+sealed interface InvocationResult {
+    data class Text(val value: String) : InvocationResult
+
+    data class Binary(val bytes: ByteArray, val contentType: ContentType) : InvocationResult {
+        override fun equals(other: Any?): Boolean {
+            if (this === other) return true
+            if (other !is Binary) return false
+            return bytes.contentEquals(other.bytes) && contentType == other.contentType
+        }
+        override fun hashCode(): Int = 31 * bytes.contentHashCode() + contentType.hashCode()
+    }
+
+    /** Streaming text result (SSE `data:` events per chunk). */
+    class TextStream(val chunks: Flow<String>) : InvocationResult
+
+    /** Streaming binary result (HTTP chunked transfer-encoding). */
+    class BinaryStream(val chunks: Flow<ByteArray>, val contentType: ContentType) : InvocationResult
+}
+
+/**
+ * Unified handler for invocation requests — single entry point for all input/output shapes.
+ *
+ * The plugin auto-dispatches the request body into an [InvocationInput] variant by
+ * `Content-Type` and size. The handler returns an [InvocationResult] variant which the
+ * plugin maps to the correct HTTP response (text, binary, SSE stream, or chunked binary).
+ *
+ * **Coroutine context warning for streaming results:** when constructing
+ * [InvocationResult.TextStream] / [InvocationResult.BinaryStream] from a callback-style SDK
+ * (e.g. AWS Bedrock's `converseStream`, whose collector runs in its own coroutine context),
+ * use [streamingFlow] / [streamingBytesFlow] rather than `flow { emit() }` — the strict
+ * `flow {}` builder will throw `IllegalStateException: Flow invariant is violated` when
+ * emit and collect happen in different contexts.
+ */
+typealias UnifiedInvocationHandler =
+    suspend RoutingContext.(input: InvocationInput, context: AgentCoreContext) -> InvocationResult
+
+/**
+ * Helper that builds a context-safe [Flow]<[String]> suitable for [InvocationResult.TextStream].
+ *
+ * Use this when emitting items from a callback whose execution context differs from the Flow
+ * collector's context (typical for AWS SDK streaming callbacks). Internally a [channelFlow] is
+ * used so `send` calls cross coroutine contexts safely.
+ */
+fun streamingFlow(
+    producer: suspend SendChannel<String>.() -> Unit,
+): Flow<String> = channelFlow { producer(this) }
+
+/** Symmetric helper for binary streams used with [InvocationResult.BinaryStream]. */
+fun streamingBytesFlow(
+    producer: suspend SendChannel<ByteArray>.() -> Unit,
+): Flow<ByteArray> = channelFlow { producer(this) }
+
+/**
+ * Typed handler for invocation requests — convenience for the common JSON-in / JSON-out case.
+ *
+ * Receives the request body already deserialized into [I] and returns a value of type [O] that is
+ * serialized back to the client. Both directions are handled by Ktor's `ContentNegotiation`
+ * plugin, so the request `Content-Type` (e.g. `application/json`) and the response `Accept`
+ * header drive the conversion. Requires `ContentNegotiation` (e.g. `json()`) to be installed.
+ *
+ * Registered via [handle].
+ */
+typealias TypedInvocationHandler<I, O> =
+    suspend RoutingContext.(input: I, context: AgentCoreContext) -> O
+
+/**
+ * Internal holder describing a typed invocation registered via [AgentCoreRuntimeConfig.handle].
+ */
+@PublishedApi
+internal class TypedInvocation(
+    val inputType: TypeInfo,
+    val outputType: TypeInfo,
+    val handle: suspend RoutingContext.(input: Any?, context: AgentCoreContext) -> Any?,
+)
+
+/** Configuration for the [AgentCoreRuntime] Ktor plugin. */
+class AgentCoreRuntimeConfig {
+    /**
+     * Single handler covering all input/output shapes. Required unless a typed handler is
+     * registered via [handle].
+     */
+    var handler: UnifiedInvocationHandler? = null
+
+    /**
+     * Threshold (in bytes) above which an inbound request body is exposed as
+     * [InvocationInput.Stream] rather than [InvocationInput.Binary]. Requests with no
+     * `Content-Length` header are also exposed as [InvocationInput.Stream].
+     *
+     * Default: 1 MiB.
+     */
+    var binaryStreamThresholdBytes: Long = 1L * 1024 * 1024
+
+    /**
+     * Maximum allowed request body size, in bytes. Requests whose `Content-Length` exceeds
+     * this value are rejected with **HTTP 413 Payload Too Large** before the handler is
+     * invoked. Requests with no `Content-Length` header are not pre-checked (the underlying
+     * engine's limits still apply).
+     *
+     * Default: 100 MiB — matches AgentCore Runtime's documented payload cap.
+     */
+    var maxRequestBytes: Long = 100L * 1024 * 1024
+
+    /**
+     * Per-request handler timeout, in milliseconds. When > 0, the unified [handler] / typed
+     * handler is wrapped in a `withTimeout(...)` block. On timeout the request fails with
+     * **HTTP 504 Gateway Timeout** and a structured JSON error body.
+     *
+     * Default: 0 — no timeout.
+     */
+    var handlerTimeoutMillis: Long = 0
+
+    /**
+     * If `true`, the plugin auto-installs Ktor's `ContentNegotiation` with a default JSON
+     * configuration (`ignoreUnknownKeys = true`) when no `ContentNegotiation` plugin is
+     * already installed. Required for the typed [handle] convenience to work.
+     *
+     * Set to `false` if you want full control over `ContentNegotiation` (custom serializers,
+     * additional formats, etc.).
+     *
+     * Default: `true`.
+     */
+    var autoInstallContentNegotiation: Boolean = true
+
+    /** The typed handler registered via [handle], if any. */
+    @PublishedApi
+    internal var typedInvocation: TypedInvocation? = null
+
+    /** Custom ping service. Defaults to [StaticAgentCorePingService]. */
+    var pingService: AgentCorePingService? = null
+
+    /**
+     * Task tracker used to report [PingStatus.HEALTHY_BUSY] while long-running background work
+     * is in progress. Exposed to the handler via [AgentCoreContext.taskTracker].
+     */
+    var taskTracker: AgentCoreTaskTracker = AgentCoreTaskTracker()
+
+    /** Rate limit for `/invocations` (requests per minute per client). 0 = no limit. */
+    var invocationsRateLimit: Int = 0
+
+    /** Rate limit for `/ping` (requests per minute per client). 0 = no limit. */
+    var pingRateLimit: Int = 0
+}
+
+/**
+ * Registers a typed invocation handler — convenience for JSON-in / JSON-out flows.
+ *
+ * When set, the unified [AgentCoreRuntimeConfig.handler] is ignored. Requires
+ * `ContentNegotiation` (e.g. `json()`) to be installed on the application.
+ *
+ * Example:
+ * ```kotlin
+ * install(AgentCoreRuntime) {
+ *     handle<MyRequest, MyResponse> { input, ctx ->
+ *         MyResponse(answer = process(input.prompt))
+ *     }
+ * }
+ * ```
+ */
+inline fun <reified I : Any, reified O> AgentCoreRuntimeConfig.handle(
+    crossinline handler: TypedInvocationHandler<I, O>,
+) {
+    typedInvocation = TypedInvocation(typeInfo<I>(), typeInfo<O>()) { input, context ->
+        @Suppress("UNCHECKED_CAST")
+        handler(input as I, context)
+    }
+}
+
+// ---------------------------------------------------------------------------
+//  Response writers
+// ---------------------------------------------------------------------------
 
 /**
  * Resolves the response `Content-Type` for the `/invocations` endpoint from the request's
- * `Accept` header, aligning with the content types produced by the reference Java contract
- * (`application/json`, `text/event-stream`, `application/octet-stream`, `text/plain`).
- *
- * Defaults to `application/json` when the `Accept` header is missing or does not match a
- * supported type (e.g. `* / *`).
+ * `Accept` header. Used for [InvocationResult.Text]: when the client asked for SSE we frame
+ * the single string as one `data:` event; for octet-stream we write raw bytes; for plain text
+ * we use `text/plain`; otherwise JSON.
  */
 internal fun resolveResponseContentType(acceptHeader: String?): ContentType {
     if (acceptHeader.isNullOrBlank()) return ContentType.Application.Json
@@ -201,32 +379,24 @@ internal fun resolveResponseContentType(acceptHeader: String?): ContentType {
     }
 }
 
-/**
- * Writes the invocation [result] back to the client using the negotiated [contentType],
- * producing a genuine body for each supported type (matching the reference Java contract):
- *
- * - `text/event-stream`: streamed via a [ByteWriteChannel] as a properly framed SSE `data:` event.
- * - `application/octet-stream`: written as raw bytes (true binary response).
- * - everything else (`application/json`, `text/plain`, ...): written as text.
- */
-internal suspend fun respondInvocationResult(call: ApplicationCall, contentType: ContentType, result: String) {
+/** Writes a textual one-shot result, choosing the responder by negotiated [contentType]. */
+internal suspend fun respondInvocationText(call: ApplicationCall, contentType: ContentType, value: String) {
     when (contentType) {
         ContentType.Text.EventStream -> call.respondBytesWriter(contentType = ContentType.Text.EventStream) {
-            writeStringUtf8("data: $result\n\n")
+            writeStringUtf8("data: $value\n\n")
             flush()
         }
         ContentType.Application.OctetStream ->
-            call.respondBytes(result.toByteArray(Charsets.UTF_8), ContentType.Application.OctetStream)
-        else -> call.respondText(result, contentType)
+            call.respondBytes(value.toByteArray(Charsets.UTF_8), ContentType.Application.OctetStream)
+        else -> call.respondText(value, contentType)
     }
 }
 
 /**
  * Streams the invocation output [chunks] back to the client as a `text/event-stream` response,
- * writing each emitted chunk as its own properly framed SSE `data:` event and flushing after each
- * one so the client receives output incrementally (e.g. token-by-token from a model stream).
+ * writing each emitted chunk as its own properly framed SSE `data:` event and flushing.
  */
-internal suspend fun respondInvocationStream(call: ApplicationCall, chunks: Flow<String>) {
+internal suspend fun respondTextStream(call: ApplicationCall, chunks: Flow<String>) {
     call.respondBytesWriter(contentType = ContentType.Text.EventStream) {
         chunks.collect { chunk ->
             writeStringUtf8("data: $chunk\n\n")
@@ -235,223 +405,98 @@ internal suspend fun respondInvocationStream(call: ApplicationCall, chunks: Flow
     }
 }
 
-/**
- * Writes a structured [InvocationResult] back to the client.
- *
- * - [InvocationResult.Text] is written via [respondInvocationResult] using the negotiated [contentType]
- *   (so text/event-stream/octet-stream negotiation still applies).
- * - [InvocationResult.Binary] is written via `respondBytes` using the result's own content type
- *   (derived from the originating block's `format`), regardless of the `Accept` header.
- */
-internal suspend fun respondInvocationResult(call: ApplicationCall, contentType: ContentType, result: InvocationResult) {
-    when (result) {
-        is InvocationResult.Text -> respondInvocationResult(call, contentType, result.value)
-        is InvocationResult.Binary -> call.respondBytes(result.bytes, result.contentType)
-    }
-}
-
-/**
- * Structured result of an invocation that may carry non-text content.
- *
- * Allows handlers to return either plain text or raw binary content (e.g. an image or audio
- * payload produced by a model) so that the plugin can pick the appropriate Ktor responder
- * (`respondText` vs `respondBytes`).
- */
-sealed interface InvocationResult {
-    /** A textual result, written via `respondText` (honoring the negotiated content type). */
-    data class Text(val value: String) : InvocationResult
-
-    /** A binary result, written via `respondBytes` with the given [contentType]. */
-    data class Binary(val bytes: ByteArray, val contentType: ContentType) : InvocationResult {
-        override fun equals(other: Any?): Boolean {
-            if (this === other) return true
-            if (other !is Binary) return false
-            return bytes.contentEquals(other.bytes) && contentType == other.contentType
+/** Streams [chunks] as a chunked binary response with the supplied [contentType]. */
+internal suspend fun respondBinaryStream(call: ApplicationCall, contentType: ContentType, chunks: Flow<ByteArray>) {
+    call.respondBytesWriter(contentType = contentType) {
+        chunks.collect { bytes ->
+            writeFully(bytes, 0, bytes.size)
+            flush()
         }
-
-        override fun hashCode(): Int = 31 * bytes.contentHashCode() + contentType.hashCode()
     }
 }
 
-/**
- * Handler type for invocation requests.
- *
- * Receives the request body as a [String] and an [AgentCoreContext] with headers,
- * executed within a [RoutingContext] so Koog's `aiAgent()` and other routing
- * extensions are available.
- */
-typealias InvocationHandler = suspend RoutingContext.(body: String, context: AgentCoreContext) -> String
-
-/**
- * Handler type for invocation requests that may produce non-text output.
- *
- * Receives the request body as a [String] and an [AgentCoreContext] with headers, and returns an
- * [InvocationResult] so the plugin can pick the correct responder (text vs binary). This is the
- * natural fit for handlers that return media (image/audio) produced by a model, e.g. by mapping a
- * Bedrock `ContentBlock` via [toInvocationResult].
- */
-typealias OutputInvocationHandler = suspend RoutingContext.(body: String, context: AgentCoreContext) -> InvocationResult
-
-/**
- * Handler type for invocation requests that produce a **stream** of output chunks.
- *
- * Receives the request body as a [String] and an [AgentCoreContext] with headers, and returns a
- * [Flow] of [String] chunks. Each emitted chunk is written to the client as its own
- * `text/event-stream` `data:` event, so callers receive output incrementally (e.g. token-by-token).
- *
- * This is the natural fit for handlers backed by a streaming model API such as Bedrock's
- * `converseStream`, where each `ContentBlockDelta` text fragment can be emitted as it arrives.
- */
-typealias StreamingInvocationHandler = suspend RoutingContext.(body: String, context: AgentCoreContext) -> Flow<String>
-
-/**
- * Typed handler for invocation requests.
- *
- * Receives the request body already deserialized into [I] and an [AgentCoreContext] with headers,
- * and returns a value of type [O] that is serialized back to the client.
- *
- * Deserialization/serialization is delegated to Ktor's `ContentNegotiation` plugin, so the request
- * `Content-Type` (e.g. `application/json`) and the response `Accept` header drive the conversion.
- */
-typealias TypedInvocationHandler<I, O> = suspend RoutingContext.(input: I, context: AgentCoreContext) -> O
-
-/**
- * Internal holder describing a typed invocation registered via [AgentCoreRuntimeConfig.handle].
- *
- * Captures the runtime [TypeInfo] of the input and output types so the plugin can delegate
- * deserialization (`call.receive`) and serialization (`call.respond`) to `ContentNegotiation`.
- */
-@PublishedApi
-internal class TypedInvocation(
-    val inputType: TypeInfo,
-    val outputType: TypeInfo,
-    val handle: suspend RoutingContext.(input: Any?, context: AgentCoreContext) -> Any?
-)
-
-/**
- * Configuration for the [AgentCoreRuntime] Ktor plugin.
- */
-class AgentCoreRuntimeConfig {
-    /**
-     * The handler that processes invocation requests.
-     * Receives the request body as a String and an [AgentCoreContext] with headers.
-     *
-     * Either this or a typed handler registered via [handle] must be set before the plugin is
-     * installed. If both are set, the typed handler takes precedence.
-     */
-    var invocationHandler: InvocationHandler? = null
-
-    /**
-     * The handler that processes invocation requests and may produce non-text output.
-     * Receives the request body as a String and an [AgentCoreContext], returning an [InvocationResult]
-     * that the plugin maps to the appropriate responder (text vs binary).
-     *
-     * Takes precedence over [invocationHandler] but not over a typed handler registered via [handle].
-     */
-    var outputInvocationHandler: OutputInvocationHandler? = null
-
-    /**
-     * The handler that processes invocation requests by streaming output chunks.
-     * Receives the request body as a String and an [AgentCoreContext], returning a [Flow] of [String]
-     * chunks that the plugin writes as individual `text/event-stream` `data:` events.
-     *
-     * Takes precedence over [outputInvocationHandler] and [invocationHandler], but not over a typed
-     * handler registered via [handle].
-     */
-    var streamingInvocationHandler: StreamingInvocationHandler? = null
-
-    /**
-     * The typed handler registered via [handle], if any.
-     */
-    @PublishedApi
-    internal var typedInvocation: TypedInvocation? = null
-
-    /**
-     * Custom ping service. If not set, a default [StaticAgentCorePingService] is used.
-     */
-    var pingService: AgentCorePingService? = null
-
-    /**
-     * Task tracker used to report [PingStatus.HEALTHY_BUSY] while long-running background
-     * work is in progress. It is exposed to the invocation handler via [AgentCoreContext.taskTracker].
-     * Provide a custom instance to share a tracker across components if needed.
-     */
-    var taskTracker: AgentCoreTaskTracker = AgentCoreTaskTracker()
-
-    /**
-     * Rate limit for `/invocations` endpoint (requests per minute per client). 0 = no limit.
-     */
-    var invocationsRateLimit: Int = 0
-
-    /**
-     * Rate limit for `/ping` endpoint (requests per minute per client). 0 = no limit.
-     */
-    var pingRateLimit: Int = 0
+/** Dispatches an [InvocationResult] to the appropriate writer. */
+internal suspend fun respondInvocationResult(call: ApplicationCall, accept: ContentType, result: InvocationResult) {
+    when (result) {
+        is InvocationResult.Text         -> respondInvocationText(call, accept, result.value)
+        is InvocationResult.Binary       -> call.respondBytes(result.bytes, result.contentType)
+        is InvocationResult.TextStream   -> respondTextStream(call, result.chunks)
+        is InvocationResult.BinaryStream -> respondBinaryStream(call, result.contentType, result.chunks)
+    }
 }
 
+// ---------------------------------------------------------------------------
+//  Input dispatcher
+// ---------------------------------------------------------------------------
+
 /**
- * Registers a typed invocation handler for the `/invocations` endpoint.
+ * Builds a single-key JSON error body using kotlinx-serialization.
+ * Optionally includes the throwable simple name as `type`.
+ */
+internal fun jsonError(message: String, type: String? = null): String =
+    kotlinx.serialization.json.Json.encodeToString(
+        kotlinx.serialization.json.JsonObject.serializer(),
+        kotlinx.serialization.json.buildJsonObject {
+            put("error", kotlinx.serialization.json.JsonPrimitive(message))
+            if (type != null) put("type", kotlinx.serialization.json.JsonPrimitive(type))
+        },
+    )
+
+/**
+ * Runs [block] with an optional timeout in milliseconds. When [timeoutMillis] is `<= 0`
+ * the block runs without any timeout wrapper.
+ */
+internal suspend inline fun <T> withOptionalTimeout(timeoutMillis: Long, crossinline block: suspend () -> T): T =
+    if (timeoutMillis > 0) kotlinx.coroutines.withTimeout(timeoutMillis) { block() } else block()
+
+/**
+ * Reads the request body and turns it into an [InvocationInput] variant according to the
+ * configured [thresholdBytes] and the request's `Content-Type` / `Content-Length`.
+ */
+internal suspend fun readInvocationInput(call: ApplicationCall, thresholdBytes: Long): InvocationInput {
+    val ct = call.request.contentType()
+
+    if (ct.match(ContentType.MultiPart.FormData) || ct.contentType.equals("multipart", ignoreCase = true)) {
+        return InvocationInput.Multipart(call.receiveMultipart())
+    }
+
+    val isText = ct.match(ContentType.Application.Json) ||
+        ct.contentType.equals("text", ignoreCase = true)
+
+    if (isText) {
+        return InvocationInput.Text(call.receiveText())
+    }
+
+    val length = call.request.contentLength() ?: -1L
+    return if (length in 0..thresholdBytes) {
+        InvocationInput.Binary(call.receive<ByteArray>(), ct)
+    } else {
+        InvocationInput.Stream(call.receiveChannel(), ct)
+    }
+}
+
+// ---------------------------------------------------------------------------
+//  The plugin
+// ---------------------------------------------------------------------------
+
+/**
+ * Ktor plugin implementing the Amazon Bedrock AgentCore Runtime contract:
  *
- * The request body is deserialized into [I] and the returned value of type [O] is serialized back
- * to the client. Both directions are handled by Ktor's `ContentNegotiation` plugin, so the request
- * `Content-Type` (e.g. `application/json`) and the response `Accept` header drive the conversion.
- * This is the Kotlin equivalent of the Java starter's typed `@AgentCoreInvocation` method.
+ * - `GET /ping` — health check with task-aware status reporting.
+ * - `POST /invocations` — invocation endpoint backed by a single unified handler.
  *
- * Requires the `ContentNegotiation` plugin (e.g. with `json()`) to be installed on the application.
- * When set, this takes precedence over [AgentCoreRuntimeConfig.invocationHandler].
- *
- * Example usage:
+ * Quick start:
  * ```kotlin
  * install(AgentCoreRuntime) {
- *     handle<MyRequest, MyResponse> { input, context ->
- *         MyResponse(answer = process(input.prompt))
- *     }
- * }
- * ```
- */
-inline fun <reified I : Any, reified O> AgentCoreRuntimeConfig.handle(
-    crossinline handler: TypedInvocationHandler<I, O>
-) {
-    typedInvocation = TypedInvocation(typeInfo<I>(), typeInfo<O>()) { input, context ->
-        @Suppress("UNCHECKED_CAST")
-        handler(input as I, context)
-    }
-}
-
-/**
- * Ktor plugin that implements the Amazon Bedrock AgentCore Runtime contract.
- *
- * Provides:
- * - `GET /ping` — health check endpoint with task-aware status reporting
- * - `POST /invocations` — invocation endpoint that forwards to a user-provided handler
- * - Per-client rate limiting on both endpoints
- * - Task tracking for HEALTHY_BUSY status
- *
- * ### Quick Start
- *
- * ```kotlin
- * fun Application.module() {
- *     install(AgentCoreRuntime) {
- *         invocationHandler = { body, context ->
- *             // Process the invocation request
- *             aiAgent(body, model = OpenAIModels.Chat.GPT4_1)
+ *     handler = { input, ctx ->
+ *         when (input) {
+ *             is InvocationInput.Text   -> InvocationResult.Text("ok: ${input.body}")
+ *             is InvocationInput.Binary -> InvocationResult.Binary(input.bytes, input.contentType)
+ *             is InvocationInput.Stream -> InvocationResult.Text("streamed ${input.contentType}")
  *         }
- *         // Optional: rate limiting
- *         invocationsRateLimit = 50  // requests per minute per client
- *         pingRateLimit = 200
  *     }
  * }
  * ```
- *
- * ### Endpoints
- *
- * **GET /ping** — Returns health status:
- * ```json
- * {"status":"Healthy","time_of_last_update":1697123456}
- * ```
- *
- * **POST /invocations** — Forwards request body to the configured handler.
- * All AgentCore headers are available via [AgentCoreContext].
  */
 val AgentCoreRuntime = createApplicationPlugin(name = "AgentCoreRuntime", createConfiguration = ::AgentCoreRuntimeConfig) {
     val logger = LoggerFactory.getLogger("AgentCoreRuntime")
@@ -459,16 +504,26 @@ val AgentCoreRuntime = createApplicationPlugin(name = "AgentCoreRuntime", create
     val taskTracker = config.taskTracker
     val pingService = config.pingService ?: StaticAgentCorePingService(taskTracker)
 
-    val stringHandler = config.invocationHandler
-    val outputHandler = config.outputInvocationHandler
-    val streamingHandler = config.streamingInvocationHandler
+    val unifiedHandler = config.handler
     val typedInvocation = config.typedInvocation
-    if (stringHandler == null && outputHandler == null && streamingHandler == null && typedInvocation == null) {
+    val streamThreshold = config.binaryStreamThresholdBytes
+    val maxRequestBytes = config.maxRequestBytes
+    val handlerTimeoutMillis = config.handlerTimeoutMillis
+    if (unifiedHandler == null && typedInvocation == null) {
         throw AgentCoreInvocationException(
-            "No invocation handler configured. Set invocationHandler, outputInvocationHandler, " +
-                "streamingInvocationHandler or register a typed handler via handle<Input, Output> { ... } " +
-                "in AgentCoreRuntime plugin configuration."
+            "No invocation handler configured. Set AgentCoreRuntimeConfig.handler or " +
+                "register a typed handler via handle<I, O> { ... }."
         )
+    }
+
+    // Auto-install ContentNegotiation with sensible JSON defaults if missing and the user
+    // hasn't disabled it. The typed handler needs ContentNegotiation; the unified handler
+    // benefits from it for `call.receive<MyType>()` etc. inside the handler body.
+    if (config.autoInstallContentNegotiation
+        && application.pluginOrNull(ContentNegotiation) == null) {
+        application.install(ContentNegotiation) {
+            json(Json { ignoreUnknownKeys = true; explicitNulls = false })
+        }
     }
 
     val hasInvocationsLimit = config.invocationsRateLimit > 0
@@ -504,7 +559,7 @@ val AgentCoreRuntime = createApplicationPlugin(name = "AgentCoreRuntime", create
                 call.respondText(
                     """{"status":"${pingResponse.status}","time_of_last_update":${pingResponse.timeOfLastUpdate}}""",
                     ContentType.Application.Json,
-                    pingResponse.httpStatus
+                    pingResponse.httpStatus,
                 )
             }
         }
@@ -512,47 +567,46 @@ val AgentCoreRuntime = createApplicationPlugin(name = "AgentCoreRuntime", create
         val invocationsRoute: Route.() -> Unit = {
             post("/invocations") {
                 val context = AgentCoreContext(call.request.headers, taskTracker)
+
+                // 413 — Payload Too Large (only when Content-Length is announced)
+                val contentLength = call.request.contentLength()
+                if (contentLength != null && contentLength > maxRequestBytes) {
+                    val body = jsonError("Payload too large: $contentLength bytes (max $maxRequestBytes)")
+                    call.respondText(body, ContentType.Application.Json, HttpStatusCode.PayloadTooLarge)
+                    return@post
+                }
+
                 try {
                     if (typedInvocation != null) {
+                        // Typed JSON-in / JSON-out via ContentNegotiation
                         val input = call.receive<Any?>(typedInvocation.inputType)
-                        val result = typedInvocation.handle(this, input, context)
+                        val result = withOptionalTimeout(handlerTimeoutMillis) {
+                            typedInvocation.handle(this@post, input, context)
+                        }
                         call.respond(result, typedInvocation.outputType)
-                    } else if (streamingHandler != null) {
-                        val body = call.receiveText()
-                        val chunks = streamingHandler(this, body, context)
-                        respondInvocationStream(call, chunks)
-                    } else if (outputHandler != null) {
-                        val body = call.receiveText()
-                        val responseContentType = resolveResponseContentType(call.request.header(HttpHeaders.Accept))
-                        val result = outputHandler(this, body, context)
-                        respondInvocationResult(call, responseContentType, result)
                     } else {
-                        val body = call.receiveText()
-                        val responseContentType = resolveResponseContentType(call.request.header(HttpHeaders.Accept))
-                        val result = stringHandler!!(this, body, context)
-                        respondInvocationResult(call, responseContentType, result)
+                        // Unified handler covers all (Input × Output) shapes
+                        val input = readInvocationInput(call, streamThreshold)
+                        val accept = resolveResponseContentType(call.request.header(HttpHeaders.Accept))
+                        val result = withOptionalTimeout(handlerTimeoutMillis) {
+                            unifiedHandler!!(this@post, input, context)
+                        }
+                        respondInvocationResult(call, accept, result)
                     }
-                } catch (e: AgentCoreInvocationException) {
-                    logger.error("Error trying to invoke AgentCore method: ${e.message}", e)
-                    call.respondText(
-                        """{"error":"${e.message?.replace("\"", "\\\"")}"}""",
-                        ContentType.Application.Json,
-                        HttpStatusCode.InternalServerError
-                    )
+                } catch (t: kotlinx.coroutines.TimeoutCancellationException) {
+                    logger.error("Handler timeout (${handlerTimeoutMillis}ms exceeded)", t)
+                    val body = jsonError("Handler timed out after ${handlerTimeoutMillis}ms")
+                    call.respondText(body, ContentType.Application.Json, HttpStatusCode.GatewayTimeout)
+                } catch (t: Throwable) {
+                    logger.error("Error invoking AgentCore handler: ${t.message}", t)
+                    val msg = t.message ?: t::class.simpleName ?: "error"
+                    val body = jsonError(msg, t::class.simpleName)
+                    call.respondText(body, ContentType.Application.Json, HttpStatusCode.InternalServerError)
                 }
             }
         }
 
-        if (hasPingLimit) {
-            rateLimit(RateLimitName("agentcore-ping"), pingRoute)
-        } else {
-            pingRoute()
-        }
-
-        if (hasInvocationsLimit) {
-            rateLimit(RateLimitName("agentcore-invocations"), invocationsRoute)
-        } else {
-            invocationsRoute()
-        }
+        if (hasPingLimit) rateLimit(RateLimitName("agentcore-ping"), pingRoute) else pingRoute()
+        if (hasInvocationsLimit) rateLimit(RateLimitName("agentcore-invocations"), invocationsRoute) else invocationsRoute()
     }
 }
